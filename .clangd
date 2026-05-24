@@ -1,0 +1,5 @@
+CompileFlags:
+  Compiler: /opt/cuda/bin/nvcc
+  Remove: 
+    - "-forward-unknown-to-host-compiler"
+    - "--generate-code*"
