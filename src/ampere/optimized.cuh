@@ -175,6 +175,112 @@ template <typename Config> struct Matmul {
   }
 };
 
+template <typename Config, int T>
+__device__ __forceinline__ void
+pipeline_drain(RegisterLoader<Config, true> &a_reg_loader,
+               RegisterLoader<Config, false> &b_reg_loader,
+               Matmul<Config> &matmul, uint32_t a_addr_base,
+               uint32_t b_addr_base, int a_stride, int b_stride,
+               int &compute_stage) {
+
+#pragma unroll
+  for (int k = 0; k < Config::WARP_COARSEN_K - 1; k++) {
+    a_reg_loader.load(a_addr_base + compute_stage * a_stride, k + 1);
+    b_reg_loader.load(b_addr_base + compute_stage * b_stride, k + 1);
+    matmul.compute(a_reg_loader.frag[k % REG_BUFFERS],
+                   b_reg_loader.frag[k % REG_BUFFERS]);
+  }
+  matmul.compute(a_reg_loader.frag[(Config::WARP_COARSEN_K - 1) % REG_BUFFERS],
+                 b_reg_loader.frag[(Config::WARP_COARSEN_K - 1) % REG_BUFFERS]);
+  asm("cp.async.wait_group %0;" ::"n"(T - 1));
+  __syncthreads();
+  compute_stage =
+      (compute_stage == MMF_NUM_BUFFERS - 1) ? 0 : compute_stage + 1;
+  a_reg_loader.load(a_addr_base + compute_stage * a_stride, 0);
+  b_reg_loader.load(b_addr_base + compute_stage * b_stride, 0);
+  if constexpr (T > 1)
+    pipeline_drain<Config, T - 1>(a_reg_loader, b_reg_loader, matmul,
+                                  a_addr_base, b_addr_base, a_stride, b_stride,
+                                  compute_stage);
+}
+
+template <typename Config>
+__device__ __forceinline__ void compute_epilogue(
+    const uint32_t (&a_frag)[Config::WARP_COARSEN_Y][WARP_MMA_FRAG_REGS],
+    const uint32_t (&b_frag)[Config::WARP_COARSEN_X][WARP_MMA_FRAG_REGS],
+    float (&acc)[Config::WARP_COARSEN_Y][Config::WARP_COARSEN_X]
+                [WARP_MMA_ACC_REGS],
+    uint32_t smem, int lane_idx, int M, int N, float *C, int row, int col) {
+  const int lane_row = lane_idx / 4;
+
+  const int row_off = lane_idx / (FRAG_MN / 4); // k / 4
+  const int col_off = lane_idx % (FRAG_MN / 4); // k % 4
+  const uint32_t ld_addr1 =
+      smem + (row_off * (FRAG_MN + 8) + col_off * 4) * sizeof(float);
+  const uint32_t ld_addr2 =
+      smem + ((row_off + 8) * (FRAG_MN + 8) + col_off * 4) * sizeof(float);
+#pragma unroll
+  for (int j = 0; j < Config::WARP_COARSEN_X; j++)
+#pragma unroll
+    for (int i = 0; i < Config::WARP_COARSEN_Y; i++) {
+      asm("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+          "{%0, %1, %2, %3}, "
+          "{%4, %5, %6, %7}, "
+          "{%8, %9}, "
+          "{%0, %1, %2, %3};"
+          : "+f"(acc[i][j][0]), "+f"(acc[i][j][1]), "+f"(acc[i][j][2]),
+            "+f"(acc[i][j][3])
+          : "r"(a_frag[i][0]), "r"(a_frag[i][1]), "r"(a_frag[i][2]),
+            "r"(a_frag[i][3]), "r"(b_frag[j][0]), "r"(b_frag[j][2]));
+
+      asm("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+          "{%0, %1, %2, %3}, "
+          "{%4, %5, %6, %7}, "
+          "{%8, %9}, "
+          "{%0, %1, %2, %3};"
+          : "+f"(acc[i][j][4]), "+f"(acc[i][j][5]), "+f"(acc[i][j][6]),
+            "+f"(acc[i][j][7])
+          : "r"(a_frag[i][0]), "r"(a_frag[i][1]), "r"(a_frag[i][2]),
+            "r"(a_frag[i][3]), "r"(b_frag[j][1]), "r"(b_frag[j][3]));
+
+      int base_col = lane_idx % 4;
+
+#pragma unroll
+      for (int r = 0; r < 4; r++) {
+        uint32_t st_addr = smem + ((lane_row + 8 * (r % 2)) * (FRAG_MN + 8) +
+                                   base_col * 2 + 8 * (r / 2)) *
+                                      sizeof(float);
+        asm("st.shared.v2.f32"
+            "[%0], {%1, %2};"
+            :
+            : "r"(st_addr), "f"(acc[i][j][2 * r]), "f"(acc[i][j][2 * r + 1]));
+      }
+
+      __syncwarp();
+
+      asm("ld.shared.v4.f32"
+          "{%0, %1, %2, %3}, [%4];"
+          : "=f"(acc[i][j][0]), "=f"(acc[i][j][1]), "=f"(acc[i][j][2]),
+            "=f"(acc[i][j][3])
+          : "r"(ld_addr1));
+      asm("ld.shared.v4.f32"
+          "{%0, %1, %2, %3}, [%4];"
+          : "=f"(acc[i][j][4]), "=f"(acc[i][j][5]), "=f"(acc[i][j][6]),
+            "=f"(acc[i][j][7])
+          : "r"(ld_addr2));
+
+      float4 *ldg_1 = reinterpret_cast<float4 *>(
+          C + (i * FRAG_MN + row_off) * N + (j * FRAG_MN + col_off * 4));
+      float4 *ldg_2 = reinterpret_cast<float4 *>(
+          C + (i * FRAG_MN + row_off + 8) * N + (j * FRAG_MN + col_off * 4));
+      *ldg_1 =
+          make_float4(acc[i][j][0], acc[i][j][1], acc[i][j][2], acc[i][j][3]);
+      *ldg_2 =
+          make_float4(acc[i][j][4], acc[i][j][5], acc[i][j][6], acc[i][j][7]);
+      __syncwarp();
+    }
+}
+
 template <typename Config>
 __global__ __launch_bounds__(
     Config::NUM_THREADS,
@@ -186,8 +292,7 @@ __global__ __launch_bounds__(
   __builtin_assume(tx >= 0 && tx < Config::NUM_THREADS);
   // thread block rasterization
   const int grid_height = (M + Config::BLOCK_HEIGHT - 1) / Config::BLOCK_HEIGHT;
-  const unsigned int grid_width =
-      ((N + Config::BLOCK_WIDTH - 1) / Config::BLOCK_WIDTH);
+  const int grid_width = ((N + Config::BLOCK_WIDTH - 1) / Config::BLOCK_WIDTH);
   const int super_col_size = Config::BLOCK_TILE_WIDTH * grid_height;
   const int super_col = blockIdx.x / super_col_size;
   const int local_idx = blockIdx.x % super_col_size;
@@ -222,14 +327,6 @@ __global__ __launch_bounds__(
   const uint32_t a_stride = Config::BLOCK_HEIGHT * Config::TILE_WIDTH * 4;
   const uint32_t b_stride = Config::BLOCK_WIDTH * Config::TILE_WIDTH * 4;
 
-  // const uint32_t a_max_offset = a_addr_base + MMF_NUM_BUFFERS * a_stride;
-
-  // uint32_t a_addr_fetch = a_addr_base;
-  // uint32_t b_addr_fetch = b_addr_base;
-  //
-  // uint32_t a_addr_compute = a_addr_base;
-  // uint32_t b_addr_compute = b_addr_base;
-
   GlobalToSharedLoader<Config, true> a_loader(A + row_block * K, K,
                                               M - row_block, tx);
   GlobalToSharedLoader<Config, false> b_loader(B + col_block * K, K,
@@ -242,43 +339,26 @@ __global__ __launch_bounds__(
   int compute_stage = 0;
   int fetch_stage = 0;
   for (; fetch_stage < MMF_NUM_BUFFERS - 1; fetch_stage++) {
-    // a_loader.load(a_addr_fetch);
-    // b_loader.load(b_addr_fetch);
     a_loader.load(a_addr_base + fetch_stage * a_stride);
     b_loader.load(b_addr_base + fetch_stage * b_stride);
-    asm volatile("cp.async.commit_group;");
-    // a_addr_fetch += a_stride;
-    // b_addr_fetch += b_stride;
+    asm("cp.async.commit_group;");
   }
 
   const int tiles = CEIL_DIV(K, Config::TILE_WIDTH);
 
-  asm volatile("cp.async.wait_group %0;" ::"n"(MMF_NUM_BUFFERS - 2));
+  asm("cp.async.wait_group %0;" ::"n"(MMF_NUM_BUFFERS - 2));
   __syncthreads();
-  // a_reg_loader.load(a_addr_compute, 0);
-  // b_reg_loader.load(b_addr_compute, 0);
   a_reg_loader.load(a_addr_base, 0);
   b_reg_loader.load(b_addr_base, 0);
 
   for (int t = 0; t < tiles - MMF_NUM_BUFFERS + 1; t++) {
-    // a_loader.load(a_addr_fetch);
-    // b_loader.load(b_addr_fetch);
     a_loader.load(a_addr_base + fetch_stage * a_stride);
     b_loader.load(b_addr_base + fetch_stage * b_stride);
 
-    // a_addr_fetch += a_stride;
-    // b_addr_fetch += b_stride;
-
-    // if (a_addr_fetch == a_max_offset) {
-    //   a_addr_fetch = a_addr_base;
-    //   b_addr_fetch = b_addr_base;
-    // }
     fetch_stage = (fetch_stage == MMF_NUM_BUFFERS - 1) ? 0 : fetch_stage + 1;
 
 #pragma unroll
     for (int k = 0; k < Config::WARP_COARSEN_K - 1; k++) {
-      // a_reg_loader.load(a_addr_compute, k + 1);
-      // b_reg_loader.load(b_addr_compute, k + 1);
       a_reg_loader.load(a_addr_base + compute_stage * a_stride, k + 1);
       b_reg_loader.load(b_addr_base + compute_stage * b_stride, k + 1);
       matmul.compute(a_reg_loader.frag[k % REG_BUFFERS],
@@ -288,102 +368,44 @@ __global__ __launch_bounds__(
         a_reg_loader.frag[(Config::WARP_COARSEN_K - 1) % REG_BUFFERS],
         b_reg_loader.frag[(Config::WARP_COARSEN_K - 1) % REG_BUFFERS]);
 
-    // fetch_stage += 1;
-    asm volatile("cp.async.commit_group;");
-    asm volatile("cp.async.wait_group %0;" ::"n"(MMF_NUM_BUFFERS - 2));
+    asm("cp.async.commit_group;");
+    asm("cp.async.wait_group %0;" ::"n"(MMF_NUM_BUFFERS - 2));
     __syncthreads();
-
-    // a_addr_compute += a_stride;
-    // b_addr_compute += b_stride;
-    //
-    // if (a_addr_compute == a_max_offset) {
-    //   a_addr_compute = a_addr_base;
-    //   b_addr_compute = b_addr_base;
-    // }
 
     compute_stage =
         (compute_stage == MMF_NUM_BUFFERS - 1) ? 0 : compute_stage + 1;
 
-    // a_reg_loader.load(a_addr_compute, 0);
-    // b_reg_loader.load(b_addr_compute, 0);
     a_reg_loader.load(a_addr_base + compute_stage * a_stride, 0);
     b_reg_loader.load(b_addr_base + compute_stage * b_stride, 0);
   }
 
-#pragma unroll
-  for (int t = tiles - MMF_NUM_BUFFERS + 1; t < tiles; t++) {
-#pragma unroll
-    for (int k = 0; k < Config::WARP_COARSEN_K - 1; k++) {
-      // a_reg_loader.load(a_addr_compute, k + 1);
-      // b_reg_loader.load(b_addr_compute, k + 1);
-      a_reg_loader.load(a_addr_base + compute_stage * a_stride, k + 1);
-      b_reg_loader.load(b_addr_base + compute_stage * b_stride, k + 1);
-      matmul.compute(a_reg_loader.frag[k % REG_BUFFERS],
-                     b_reg_loader.frag[k % REG_BUFFERS]);
-    }
-    matmul.compute(
-        a_reg_loader.frag[(Config::WARP_COARSEN_K - 1) % REG_BUFFERS],
-        b_reg_loader.frag[(Config::WARP_COARSEN_K - 1) % REG_BUFFERS]);
-    if (tiles - t > 1)
-      asm volatile("cp.async.wait_group %0;" ::"n"(0));
-    __syncthreads();
-    if (tiles - t > 1) {
-      // a_addr_compute += a_stride;
-      // b_addr_compute += b_stride;
-      //
-      // if (a_addr_compute == a_max_offset) {
-      //   a_addr_compute = a_addr_base;
-      //   b_addr_compute = b_addr_base;
-      // }
-      // a_reg_loader.load(a_addr_compute, 0);
-      // b_reg_loader.load(b_addr_compute, 0);
-      compute_stage =
-          (compute_stage == MMF_NUM_BUFFERS - 1) ? 0 : compute_stage + 1;
-      a_reg_loader.load(a_addr_base + compute_stage * a_stride, 0);
-      b_reg_loader.load(b_addr_base + compute_stage * b_stride, 0);
-    }
-  }
-
-  const unsigned int lane_row = lane_idx / 4;
-  const unsigned int lane_col = (lane_idx % 4) * 2;
-  float *c_tile =
-      smem_block +
-      (warpIdx_y * Config::BLOCK_NWARPS_X + warpIdx_x) * FRAG_MN * FRAG_MN;
-  float4 *C4 = reinterpret_cast<float4 *>(C);
-  float4 *c_tile4 = reinterpret_cast<float4 *>(c_tile);
+  pipeline_drain<Config, MMF_NUM_BUFFERS - 2>(
+      a_reg_loader, b_reg_loader, matmul, a_addr_base, b_addr_base, a_stride,
+      b_stride, compute_stage);
 
 #pragma unroll
-  for (int i = 0; i < Config::WARP_COARSEN_Y; i++) {
-#pragma unroll
-    for (int j = 0; j < Config::WARP_COARSEN_X; j++) {
-#pragma unroll
-      for (int r = 0; r < WARP_MMA_ACC_REGS; r++) {
-        const unsigned int row_off = (r / 2) % 2 * 8 + lane_row;
-        const unsigned int col_off = r % 2 + r / 4 * 8 + lane_col;
-        c_tile[row_off * FRAG_MN + col_off] = matmul.acc[i][j][r];
-      }
-      __syncwarp();
-      const unsigned int row_iter = i * FRAG_MN;
-      const unsigned int col_iter = j * FRAG_MN / 4;
-      for (unsigned int k = lane_idx; k < FRAG_MN * FRAG_MN / 4;
-           k += WARP_SIZE) {
-        const unsigned int row_off = k / (FRAG_MN / 4);
-        const unsigned int col_off = k % (FRAG_MN / 4);
-        if (row + row_iter + row_off < M &&
-            col / 4 + col_iter + col_off < N / 4) {
-          float4 val = c_tile4[row_off * FRAG_MN / 4 + col_off];
-          C4[(row + row_iter + row_off) * (N / 4) + col / 4 + col_iter +
-             col_off] = val;
-        }
-      }
-      __syncwarp();
-    }
+  for (int k = 0; k < Config::WARP_COARSEN_K - 1; k++) {
+    a_reg_loader.load(a_addr_base + compute_stage * a_stride, k + 1);
+    b_reg_loader.load(b_addr_base + compute_stage * b_stride, k + 1);
+    matmul.compute(a_reg_loader.frag[k % REG_BUFFERS],
+                   b_reg_loader.frag[k % REG_BUFFERS]);
   }
+
+  compute_stage =
+      (compute_stage == MMF_NUM_BUFFERS - 1) ? 0 : compute_stage + 1;
+  uint32_t c_tile = (a_addr_base + compute_stage * a_stride) +
+                    (warpIdx_y * Config::BLOCK_NWARPS_X + warpIdx_x) * FRAG_MN *
+                        (FRAG_MN + 8) * sizeof(float);
+  compute_epilogue<Config>(
+      a_reg_loader.frag[(Config::WARP_COARSEN_K - 1) % REG_BUFFERS],
+      b_reg_loader.frag[(Config::WARP_COARSEN_K - 1) % REG_BUFFERS], matmul.acc,
+      c_tile, lane_idx, M, N, C + row * N + col, row, col);
 }
 
 void matmul_optimized(const float *A, const float *B, float *C, int M, int K,
                       int N) {
-  // Implement this
+  // implementation technically only works if TILE_WIDTH divides K
+  // also if 4 divides N
   auto launch_kernel = [&](auto config_instance) {
     using Config = decltype(config_instance);
 
@@ -405,7 +427,8 @@ void matmul_optimized(const float *A, const float *B, float *C, int M, int K,
         <<<gridDim, blockDim, smem_size>>>(A, B, C, M, K, N);
   };
 
-  launch_kernel(GemmConfig<4, 2, 2, 2, 4, 2>{});
+  // launch_kernel(GemmConfig<4, 2, 2, 2, 4, 2>{});
+  launch_kernel(GemmConfig<2, 4, 2, 4, 2, 2>{});
 }
 
 #endif // __MATMUL_KERNEL_CUH__

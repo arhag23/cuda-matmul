@@ -18,3 +18,5 @@ find_package(CUDAToolkit REQUIRED)
 add_executable(bench bench.cu)
 target_include_directories(bench PRIVATE src)
 target_link_libraries(bench PRIVATE CUDA::cublas)
+
+target_compile_options(bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v;-lineinfo;-g>)

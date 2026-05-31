@@ -8,12 +8,13 @@
 void init_random_matrix(float *mat, int N) {
   for (int i = 0; i < N; i++) {
     float r = (float)rand() / RAND_MAX;
-    mat[i] = (r * 2.0f) - 1.0f;
+    // mat[i] = (r * 2.0f) - 1.0f;
+    mat[i] = r;
   }
 }
 
 bool verify_matrix(float *ref, float *inp, int N) {
-  constexpr float REL_EPS = 5e-2f;
+  constexpr float REL_EPS = 5e-3f;
   constexpr float ABS_EPS = 1e-1f;
 
   for (int i = 0; i < N; i++) {
