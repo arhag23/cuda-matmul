@@ -1,5 +1,5 @@
-#ifndef __MATMUL_KERNEL_CUH__
-#define __MATMUL_KERNEL_CUH__
+#ifndef __OPTIMIZED_CUH__
+#define __OPTIMIZED_CUH__
 
 #include <cuda_runtime.h>
 
@@ -431,4 +431,4 @@ void matmul_optimized(const float *A, const float *B, float *C, int M, int K,
   launch_kernel(GemmConfig<2, 4, 2, 4, 2, 2>{});
 }
 
-#endif // __MATMUL_KERNEL_CUH__
+#endif // __OPTIMIZED_CUH__

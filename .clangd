@@ -3,3 +3,7 @@ CompileFlags:
   Remove: 
     - "-forward-unknown-to-host-compiler"
     - "--generate-code*"
+    - "--ptxas-options=*"
+  Add:
+    - "--offload-arch=sm_89"
+    

@@ -4,6 +4,8 @@
 
 #include <cuda_runtime.h>
 
+#include "ampere/1_baseline.cuh"
+#include "ampere/2_warptiling.cuh"
 #include "ampere/optimized.cuh"
 #include "cuda_utils.cuh"
 #include "utils.cuh"
@@ -14,7 +16,8 @@
 #define WARMUP_ITERS 50
 #define BENCH_ITERS 500
 
-const char *kernels[] = {"0. cublas", "1. optimized"};
+const char *kernels[] = {"0. cublas", "1. optimized", "2. baseline",
+                         "3. warptiling"};
 
 void run_kernel(int num, const float *A, const float *B, float *C);
 
@@ -123,6 +126,12 @@ void run_kernel(int num, const float *A, const float *B, float *C) {
     break;
   case 1:
     matmul_optimized(A, B, C, TEST_DIM_M, TEST_DIM_K, TEST_DIM_N);
+    break;
+  case 2:
+    matmul_baseline(A, B, C, TEST_DIM_M, TEST_DIM_K, TEST_DIM_N);
+    break;
+  case 3:
+    matmul_warptiling(A, B, C, TEST_DIM_M, TEST_DIM_K, TEST_DIM_N);
     break;
   }
 }
